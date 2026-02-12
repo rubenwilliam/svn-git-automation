@@ -281,36 +281,6 @@
       args:
         chdir: "{{ git_base_path }}/{{ item.name }}.git"
       loop: "{{ repos }}"
-    
-    - name: Create verification script
-      copy:
-        content: |
-          #!/bin/bash
-          echo "=== SVN and Git Server Verification ==="
-          echo ""
-          echo "SVN Repositories:"
-          ls -lh {{ svn_base_path }}
-          echo ""
-          echo "Git Repositories:"
-          ls -lh {{ git_base_path }}
-          echo ""
-          echo "SVN Repository Info:"
-          {% for repo in repos %}
-          echo "- {{ repo.name }}:"
-          svnlook info {{ svn_base_path }}/{{ repo.name }} | head -5
-          echo ""
-          {% endfor %}
-          echo "Git Repository Info:"
-          {% for repo in repos %}
-          echo "- {{ repo.name }}:"
-          cd {{ git_base_path }}/{{ repo.name }}.git && git show-ref
-          echo ""
-          {% endfor %}
-          echo "=== Access URLs ==="
-          echo "SVN: http://{{ ansible_default_ipv4.address }}/svn/[repo-name]"
-          echo "Git: http://{{ ansible_default_ipv4.address }}/git/[repo-name].git"
-        dest: /usr/local/bin/verify-setup.sh
-        mode: '0755'
 
   handlers:
     - name: restart apache2
