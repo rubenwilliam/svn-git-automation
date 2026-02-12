@@ -1,0 +1,5 @@
+[ec2_server]
+localhost ansible_connection=local
+
+[ec2_server:vars]
+ansible_python_interpreter=/usr/bin/python3
