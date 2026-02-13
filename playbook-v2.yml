@@ -1,0 +1,318 @@
+- name: Setup SVN and Git Server with Automated Migration
+  hosts: ec2_server
+  become: yes
+  
+  vars:
+    svn_base_path: /var/svn
+    git_base_path: /var/git
+    repos:
+      - name: project1
+        description: "First Project Repository"
+      - name: project2
+        description: "Second Project Repository"
+  
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+    
+    - name: Install required packages
+      apt:
+        name:
+          - subversion
+          - git
+          - git-svn
+          - apache2
+          - libapache2-mod-svn
+          - lsof
+          - net-tools
+        state: present
+      when: ansible_os_family == "Debian"
+    
+    # SVN Setup
+    - name: Create SVN base directory
+      file:
+        path: "{{ svn_base_path }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+    
+    - name: Create SVN repositories
+      command: svnadmin create {{ svn_base_path }}/{{ item.name }}
+      args:
+        creates: "{{ svn_base_path }}/{{ item.name }}/format"
+      loop: "{{ repos }}"
+    
+    - name: Set SVN repository ownership
+      file:
+        path: "{{ svn_base_path }}/{{ item.name }}"
+        owner: www-data
+        group: www-data
+        recurse: yes
+      loop: "{{ repos }}"
+    
+    - name: Initialize SVN repositories with standard layout
+      shell: |
+        set -e
+        # Check if already initialized
+        if svnlook tree {{ svn_base_path }}/{{ item.name }} 2>/dev/null | grep -q "trunk/"; then
+          echo "Repository {{ item.name }} already initialized"
+          exit 0
+        fi
+        
+        # Create standard directories
+        svn mkdir file://{{ svn_base_path }}/{{ item.name }}/trunk \
+                  file://{{ svn_base_path }}/{{ item.name }}/branches \
+                  file://{{ svn_base_path }}/{{ item.name }}/tags \
+                  -m "Initial repository structure" \
+                  --username ansible
+        
+        # Verify revision was created
+        YOUNGEST=$(svnlook youngest {{ svn_base_path }}/{{ item.name }})
+        if [ "$YOUNGEST" -eq 0 ]; then
+          echo "ERROR: Failed to create initial revision"
+          exit 1
+        fi
+        echo "Created structure for {{ item.name }}, revision $YOUNGEST"
+      loop: "{{ repos }}"
+      register: svn_structure
+      changed_when: "'already initialized' not in svn_structure.stdout"
+    
+    - name: Add sample files to SVN repositories
+      shell: |
+        set -e
+        
+        # Check if files already exist
+        if svnlook tree {{ svn_base_path }}/{{ item.name }} | grep -q "README.md"; then
+          echo "Sample files already added to {{ item.name }}"
+          exit 0
+        fi
+        
+        TEMP_DIR=$(mktemp -d)
+        cd $TEMP_DIR
+        
+        # Checkout trunk
+        svn checkout file://{{ svn_base_path }}/{{ item.name }}/trunk checkout
+        cd checkout
+        
+        # Create sample files
+        echo "# {{ item.description }}" > README.md
+        echo "Sample content for {{ item.name }}" > sample.txt
+        echo "Created on $(date)" >> sample.txt
+        
+        # Create source directory
+        mkdir -p src
+        echo "print('Hello from {{ item.name }}')" > src/main.py
+        echo "# Main application file" >> src/main.py
+        
+        # Add all files
+        svn add * --force
+        
+        # ===== SVN ATTRIBUTES =====
+        svn propset svn:eol-style LF README.md
+        svn propset svn:eol-style LF src/main.py
+        svn propset svn:keywords "Id Author Date Revision" README.md
+        svn propset svn:ignore "*.log
+        tmp
+        node_modules" .
+        
+        # ===== Create Branch =====
+        svn copy \
+          file://{{ svn_base_path }}/{{ item.name }}/trunk \
+          file://{{ svn_base_path }}/{{ item.name }}/branches/dev \
+          -m "Create dev branch" \
+          --username ansible
+
+        # ===== Create Tag =====
+        svn copy \
+          file://{{ svn_base_path }}/{{ item.name }}/trunk \
+          file://{{ svn_base_path }}/{{ item.name }}/tags/v1.0 \
+          -m "Create v1.0 tag" \
+          --username ansible
+
+        # Commit
+        svn commit -m "Add initial files to {{ item.name }}" --username ansible
+        
+        # Cleanup
+        cd /
+        rm -rf $TEMP_DIR
+        
+        echo "Added sample files to {{ item.name }}"
+      loop: "{{ repos }}"
+      register: svn_init
+      changed_when: "'already added' not in svn_init.stdout"
+    
+    - name: Verify SVN repositories have commits
+      shell: |
+        YOUNGEST=$(svnlook youngest {{ svn_base_path }}/{{ item.name }})
+        if [ "$YOUNGEST" -lt 1 ]; then
+          echo "ERROR: Repository {{ item.name }} has no commits"
+          exit 1
+        fi
+        echo "Repository {{ item.name }} has $YOUNGEST revisions"
+      loop: "{{ repos }}"
+      register: svn_verify
+      changed_when: false
+    
+    # Git Setup
+    - name: Create Git base directory
+      file:
+        path: "{{ git_base_path }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+    
+    # Migration from SVN to Git
+    - name: Create migration script
+      copy:
+        content: |
+          #!/bin/bash
+          set -e
+
+          SVN_REPO=$1
+          GIT_REPO=$2
+
+          echo "Migrating $SVN_REPO → $GIT_REPO"
+
+          TMP=$(mktemp -d)
+          cd "$TMP"
+
+          echo "Cloning SVN..."
+          git svn clone "file://$SVN_REPO" \
+            --trunk=trunk \
+            --branches=branches \
+            --tags=tags \
+            --preserve-empty-dirs \
+            migrated-repo
+
+          cd migrated-repo
+          
+          #convert SVN ignore
+          git svn show-ignore > .gitignore || true
+          git add .gitignore
+          git commit -m "Convert svn ignore to gitignore"
+
+          echo "Verify commits..."
+          git log -1
+
+          COMMITS=$(git rev-list --all --count)
+          echo "Found $COMMITS commits"
+
+          echo "Create bare repo..."
+          if [ ! -d "$GIT_REPO" ]; then
+            git init --bare "$GIT_REPO"
+          fi
+
+          echo "Add remote..."
+          git remote add bare "$GIT_REPO"
+
+          echo "Push mirror..."
+          git push bare --mirror
+
+          echo "Verify result..."
+          git --git-dir="$GIT_REPO" show-ref
+
+          cd /
+          rm -rf "$TMP"
+
+          echo "Migration DONE"
+        dest: /usr/local/bin/migrate-svn-to-git.sh
+        mode: '0755'
+
+
+    - name: Migrate SVN repositories to Git
+      command: /usr/local/bin/migrate-svn-to-git.sh {{ svn_base_path }}/{{ item.name }} {{ git_base_path }}/{{ item.name }}.git
+      args:
+        creates: "{{ git_base_path }}/{{ item.name }}.git/HEAD"
+      loop: "{{ repos }}"
+      register: migration_result
+      failed_when: migration_result.rc != 0
+    
+    - name: Display migration results
+      debug:
+        msg: "Migration of {{ item.item.name }}: {{ 'SUCCESS' if item.rc == 0 else 'FAILED' }}"
+      loop: "{{ migration_result.results }}"
+      when: migration_result is defined
+    
+    - name: Set Git repository ownership
+      file:
+        path: "{{ git_base_path }}/{{ item.name }}.git"
+        owner: www-data
+        group: www-data
+        recurse: yes
+      loop: "{{ repos }}"
+    
+    - name: Enable Git HTTP access
+      copy:
+        content: |
+          <VirtualHost *:5678>
+            ServerName {{ ansible_hostname }}
+          
+            SetEnv GIT_PROJECT_ROOT {{ git_base_path }}
+            SetEnv GIT_HTTP_EXPORT_ALL
+
+            ScriptAlias /git/ /usr/lib/git-core/git-http-backend/
+  
+            <Directory /usr/lib/git-core>
+                Options +ExecCGI
+                Require all granted
+            </Directory>
+
+            <Location /svn>
+                DAV svn
+                SVNParentPath {{ svn_base_path }}
+                SVNListParentPath on
+                Require all granted
+            </Location>
+          </VirtualHost>
+        dest: /etc/apache2/sites-available/svn-git.conf
+
+    - name: Configure Apache to Listen on 5678
+      lineinfile:
+        path: /etc/apache2/ports.conf
+        line: "Listen 5678"
+        state: present
+      notify: restart apache2 
+    
+    - name: Enable Apache modules
+      apache2_module:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - dav
+        - dav_svn
+        - env
+        - cgid
+      notify: restart apache2
+    
+    - name: Enable SVN-Git site
+      command: a2ensite svn-git.conf
+      args:
+        creates: /etc/apache2/sites-enabled/svn-git.conf
+      notify: restart apache2
+    
+    - name: Disable default site
+      command: a2dissite 000-default.conf
+      args:
+        removes: /etc/apache2/sites-enabled/000-default.conf
+      notify: restart apache2
+    
+    - name: Update Git repository hooks for HTTP push
+      shell: |
+        git config --system --add safe.directory {{ git_base_path }}/{{ item.name }}.git || true
+        sudo -u www-data git config http.receivepack true
+        sudo -u www-data git update-server-info
+      args:
+        chdir: "{{ git_base_path }}/{{ item.name }}.git"
+      loop: "{{ repos }}"
+    
+
+  handlers:
+    - name: restart apache2
+      service:
+        name: apache2
+        state: restarted
