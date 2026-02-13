@@ -109,15 +109,22 @@
         echo "# Main application file" >> src/main.py
         
         # Add all files
-        svn add * --force
+        svn add --force .
+
         
+        #set property
+        printf "*.log\ntmp\nnode_modules\n" > ignore.txt
+
         # ===== SVN ATTRIBUTES =====
         svn propset svn:eol-style LF README.md
         svn propset svn:eol-style LF src/main.py
         svn propset svn:keywords "Id Author Date Revision" README.md
-        svn propset svn:ignore "*.log
-        tmp
-        node_modules" .
+        svn propset svn:ignore -F ignore.txt .
+        
+        rm ignore.txt
+
+        # Commit
+        svn commit -m "Add initial files to {{ item.name }}" --username ansible
         
         # ===== Create Branch =====
         svn copy \
@@ -132,10 +139,7 @@
           file://{{ svn_base_path }}/{{ item.name }}/tags/v1.0 \
           -m "Create v1.0 tag" \
           --username ansible
-
-        # Commit
-        svn commit -m "Add initial files to {{ item.name }}" --username ansible
-        
+            
         # Cleanup
         cd /
         rm -rf $TEMP_DIR
@@ -304,8 +308,10 @@
     - name: Update Git repository hooks for HTTP push
       shell: |
         git config --system --add safe.directory {{ git_base_path }}/{{ item.name }}.git || true
-        sudo -u www-data git config http.receivepack true
-        sudo -u www-data git update-server-info
+        #sudo -u www-data git config http.receivepack true
+        #sudo -u www-data git update-server-info
+        git config --file config http.receivepack true
+
       args:
         chdir: "{{ git_base_path }}/{{ item.name }}.git"
       loop: "{{ repos }}"
